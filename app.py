@@ -26,6 +26,7 @@ import importlib.util
 import io
 import os
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -51,6 +52,13 @@ DEFAULT_STEPS = 2
 # The SD-Turbo model card uses guidance_scale=0.0 (no classifier-free guidance).
 SD_TURBO_GUIDANCE = 0.0
 MAX_RESULTS = 12
+
+# The Diffusers pipeline is cached once per server process and shared by every
+# Streamlit session. Its scheduler is STATEFUL (timesteps, sigmas, step_index),
+# so two overlapping generations corrupt each other's scheduler state and the
+# scheduler indexes past the end of its sigmas array. Every pipeline execution
+# is therefore serialised by this lock.
+_PIPELINE_LOCK = threading.Lock()
 
 SAMPLE_PROMPTS = [
     "A small red bicycle parked beside a blue brick wall on a rainy city street at dusk, editorial photograph.",
@@ -163,6 +171,133 @@ def torch_report() -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Shape / state validation
+#
+# These checks exist so that a bad tensor layout, a wrong channel count or a
+# corrupted scheduler produces a precise, actionable message instead of a raw
+# library IndexError/RuntimeError.
+# --------------------------------------------------------------------------- #
+
+def _vae_scale_factor(pipe) -> int:
+    """Spatial downscale factor of the pipeline's VAE (8 for SD 1.x/2.x/turbo)."""
+    try:
+        return 2 ** (len(pipe.vae.config.block_out_channels) - 1)
+    except Exception:
+        return 8
+
+
+def validate_requested_size(pipe, size: int) -> None:
+    """Fail early, and clearly, if width/height cannot be encoded by the VAE."""
+    factor = _vae_scale_factor(pipe)
+    size = int(size)
+    if size <= 0 or size % factor != 0:
+        raise GenerationError(
+            f"Image size {size}x{size} is not usable by this model: width and "
+            f"height must be positive multiples of {factor} (the VAE downsample "
+            f"factor). Choose one of {ALLOWED_SIZES}."
+        )
+
+
+def prepare_scheduler(pipe, steps: int, device: str) -> None:
+    """Put the shared, stateful scheduler into a known state and verify it.
+
+    A scheduler configured for N steps has len(timesteps) == N and
+    len(sigmas) == N + 1. If those disagree with the loop that is about to run,
+    the scheduler indexes past the end of sigmas and raises
+    ``IndexError: index 3 is out of bounds for dimension 0 with size 3``
+    (3 == sigmas length for a 2-step schedule).
+    """
+    scheduler = getattr(pipe, "scheduler", None)
+    if scheduler is None:
+        return
+    try:
+        scheduler.set_timesteps(int(steps), device=device)
+    except TypeError:                      # older schedulers take no device kwarg
+        scheduler.set_timesteps(int(steps))
+
+    n_timesteps = len(getattr(scheduler, "timesteps", []))
+    if n_timesteps != int(steps):
+        raise GenerationError(
+            f"Scheduler/mismatch before generation: requested {steps} steps but "
+            f"the scheduler produced {n_timesteps} timesteps. This usually means "
+            f"another session was using the shared pipeline at the same time."
+        )
+    sigmas = getattr(scheduler, "sigmas", None)
+    if sigmas is not None and len(sigmas) != int(steps) + 1:
+        raise GenerationError(
+            f"Scheduler state is inconsistent: {steps} steps require "
+            f"{int(steps) + 1} sigma values but {len(sigmas)} were found. "
+            "Restart the Streamlit server to clear the cached pipeline."
+        )
+
+
+def reset_scheduler_after_run(pipe, steps: int, device: str) -> None:
+    """Best-effort self-heal: leave the shared scheduler clean for the next run.
+
+    Called after an image has already been produced successfully, so a failure
+    here must never destroy a valid result.
+    """
+    scheduler = getattr(pipe, "scheduler", None)
+    sigmas = getattr(scheduler, "sigmas", None)
+    if sigmas is None or len(sigmas) == int(steps) + 1:
+        return
+    try:
+        prepare_scheduler(pipe, steps, device)
+    except Exception:
+        pass
+
+
+def to_rgb_pil(image, expected_size: int | None = None):
+    """Coerce a generator output into an RGB PIL image, validating the layout.
+
+    Handles PIL images, numpy/torch arrays in HWC or CHW layout, with or without
+    a leading batch dimension, and 1/3/4 channel data. A 4-channel (RGBA) input
+    is converted to RGB rather than indexed at channel 3 and failing.
+    """
+    from PIL import Image as _Image
+
+    if isinstance(image, _Image.Image):
+        return image.convert("RGB") if image.mode != "RGB" else image
+
+    if not hasattr(image, "shape"):
+        raise GenerationError(
+            f"The generator returned {type(image).__name__}, but a PIL image or "
+            "an image array was expected."
+        )
+
+    import numpy as np
+
+    array = image.detach().cpu().numpy() if hasattr(image, "detach") else np.asarray(image)
+    array = np.squeeze(array)
+
+    if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+        array = array.transpose(1, 2, 0)          # CHW -> HWC
+    elif array.ndim == 3 and array.shape[-1] in (3, 4):
+        pass                                      # already HWC
+    elif array.ndim == 2:
+        array = np.stack([array] * 3, axis=-1)    # grayscale -> RGB
+    else:
+        raise GenerationError(
+            f"Unsupported image array shape {tuple(array.shape)}. Expected CHW "
+            "or HWC with 1, 3 or 4 channels."
+        )
+
+    if array.dtype != np.uint8:
+        if array.max() <= 1.0 + 1e-6:
+            array = array * 255.0
+        array = np.clip(array, 0, 255).round().astype("uint8")
+
+    pil = _Image.fromarray(array)
+    if pil.mode != "RGB":
+        pil = pil.convert("RGB")
+    if expected_size is not None and pil.size != (int(expected_size), int(expected_size)):
+        # Not fatal: some hosted providers round to their own size. The result
+        # records the real dimensions it received.
+        pass
+    return pil
+
+
+# --------------------------------------------------------------------------- #
 # Model loading (lazy, cached)
 # --------------------------------------------------------------------------- #
 
@@ -179,7 +314,15 @@ def load_local_pipeline(model_id: str):
     if use_cuda:
         kwargs["variant"] = "fp16"
 
-    pipe = AutoPipelineForText2Image.from_pretrained(model_id, **kwargs)
+    try:
+        pipe = AutoPipelineForText2Image.from_pretrained(model_id, **kwargs)
+    except OSError as exc:
+        # Some checkpoints ship only .bin weights; retry without safetensors
+        # rather than failing the whole run.
+        if "safetensors" not in str(exc).lower():
+            raise
+        kwargs.pop("use_safetensors", None)
+        pipe = AutoPipelineForText2Image.from_pretrained(model_id, **kwargs)
     pipe = pipe.to("cuda" if use_cuda else "cpu")
     pipe.set_progress_bar_config(disable=True)
     try:
@@ -209,25 +352,64 @@ def load_clip():
 # Generation backends
 # --------------------------------------------------------------------------- #
 
-def generate_local(prompt: str, steps: int, size: int, seed: int) -> tuple[object, float]:
+def generate_local(
+    prompt: str,
+    steps: int,
+    size: int,
+    seed: int,
+    *,
+    pipe=None,
+    model_id: str = SD_TURBO_MODEL_ID,
+) -> tuple[object, float]:
+    """Generate one image locally with Diffusers.
+
+    ``pipe``/``model_id`` exist so tests can inject a small pipeline; the UI
+    always uses the defaults (the cached SD-Turbo pipeline).
+    """
     require_packages("torch", "diffusers", "transformers", "accelerate")
     import torch
 
-    pipe = load_local_pipeline(SD_TURBO_MODEL_ID)
+    if pipe is None:
+        pipe = load_local_pipeline(model_id)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    validate_requested_size(pipe, size)
     generator = torch.Generator(device=device).manual_seed(int(seed))
 
     started = time.perf_counter()
-    out = pipe(
-        prompt=prompt,
-        num_inference_steps=int(steps),
-        guidance_scale=SD_TURBO_GUIDANCE,
-        width=int(size),
-        height=int(size),
-        generator=generator,
-    )
+    # Serialise the whole denoising loop. The cached pipeline is shared by all
+    # sessions and its scheduler is mutable; concurrent runs would otherwise
+    # reset each other's set_timesteps()/step_index mid-loop and raise
+    # "IndexError: index 3 is out of bounds for dimension 0 with size 3".
+    with _PIPELINE_LOCK:
+        prepare_scheduler(pipe, steps, device)
+        try:
+            out = pipe(
+                prompt=prompt,
+                num_inference_steps=int(steps),
+                guidance_scale=SD_TURBO_GUIDANCE,
+                width=int(size),
+                height=int(size),
+                generator=generator,
+            )
+        except IndexError as exc:
+            # A scheduler overrun is a state problem, not a bad prompt. Report it
+            # as such instead of letting a bare IndexError reach the user.
+            raise GenerationError(
+                "The diffusion scheduler ran out of timesteps "
+                f"(IndexError: {exc}). The shared pipeline's scheduler state was "
+                "invalid: another generation was probably in progress. Retry; if "
+                "it persists, restart the Streamlit server."
+            ) from exc
+        reset_scheduler_after_run(pipe, steps, device)
     elapsed = time.perf_counter() - started
-    return out.images[0].convert("RGB"), elapsed
+
+    images = getattr(out, "images", None)
+    if not images:
+        raise GenerationError(
+            "The pipeline returned no images (output.images was empty or missing)."
+        )
+    return to_rgb_pil(images[0], expected_size=size), elapsed
 
 
 def generate_hosted(
@@ -261,7 +443,7 @@ def generate_hosted(
     except Exception as exc:
         raise GenerationError(_explain_hosted_error(exc)) from exc
     elapsed = time.perf_counter() - started
-    return image.convert("RGB"), elapsed
+    return to_rgb_pil(image, expected_size=size), elapsed
 
 
 def _explain_hosted_error(exc: Exception) -> str:
@@ -295,26 +477,75 @@ def clip_similarity(prompt: str, image) -> float:
     import torch
 
     model, processor = load_clip()
+    rgb = to_rgb_pil(image)
     inputs = processor(
         text=[prompt],
-        images=image.convert("RGB"),
+        images=rgb,
         return_tensors="pt",
         truncation=True,
         padding=True,
     )
+
+    if "pixel_values" not in inputs:
+        raise ScoringError(
+            "CLIP preprocessing produced no pixel_values; the image could not be "
+            f"read (got {type(image).__name__})."
+        )
+    pixel_shape = tuple(inputs["pixel_values"].shape)
+    if len(pixel_shape) != 4 or pixel_shape[1] != 3:
+        raise ScoringError(
+            f"CLIP expected pixel_values shaped (batch, 3, height, width) but got "
+            f"{pixel_shape}. A CHW/HWC or RGBA/RGB mismatch would cause this."
+        )
+
     with torch.no_grad():
         # One forward pass returns the *projected* embeddings in the shared
         # space (text_embeds / image_embeds). This is stable across the
         # transformers 4.x and 5.x APIs, unlike get_text_features(), whose
         # return type changed.
         outputs = model(**inputs)
-        text_emb = outputs.text_embeds
-        image_emb = outputs.image_embeds
+        text_emb = getattr(outputs, "text_embeds", None)
+        image_emb = getattr(outputs, "image_embeds", None)
 
-    text_emb = text_emb / text_emb.norm(p=2, dim=-1, keepdim=True)
-    image_emb = image_emb / image_emb.norm(p=2, dim=-1, keepdim=True)
-    cosine = (text_emb * image_emb).sum(dim=-1)
-    return float(cosine.item())
+    if text_emb is None or image_emb is None:
+        raise ScoringError(
+            "CLIP returned no projected embeddings (text_embeds/image_embeds "
+            "missing from the model output)."
+        )
+    if text_emb.ndim != 2 or image_emb.ndim != 2:
+        raise ScoringError(
+            "CLIP embeddings must be 2-D (batch, dim) but got "
+            f"{tuple(text_emb.shape)} and {tuple(image_emb.shape)}."
+        )
+    if text_emb.shape[0] != 1 or image_emb.shape[0] != 1:
+        raise ScoringError(
+            f"Expected a batch of 1 prompt/image, got {text_emb.shape[0]} text and "
+            f"{image_emb.shape[0]} image embeddings."
+        )
+    if text_emb.shape[-1] != image_emb.shape[-1]:
+        raise ScoringError(
+            f"CLIP embedding dimensions differ: text {text_emb.shape[-1]} vs image "
+            f"{image_emb.shape[-1]}."
+        )
+    if not torch.isfinite(text_emb).all() or not torch.isfinite(image_emb).all():
+        raise ScoringError("CLIP produced non-finite embeddings (NaN or inf).")
+
+    text_norm = text_emb.norm(p=2, dim=-1, keepdim=True)
+    image_norm = image_emb.norm(p=2, dim=-1, keepdim=True)
+    if float(text_norm.min()) == 0.0 or float(image_norm.min()) == 0.0:
+        raise ScoringError(
+            "Cannot normalise a zero-length CLIP embedding; cosine similarity is "
+            "undefined for this image/prompt pair."
+        )
+
+    cosine = ((text_emb / text_norm) * (image_emb / image_norm)).sum(dim=-1)
+    value = float(cosine.item())
+    if not (-1.0 - 1e-4 <= value <= 1.0 + 1e-4):
+        raise ScoringError(
+            f"Cosine similarity {value:.6f} is outside the mathematical range "
+            "[-1, 1]; the embeddings or normalization are wrong."
+        )
+    return value
 
 
 def evaluate(result: Result) -> None:

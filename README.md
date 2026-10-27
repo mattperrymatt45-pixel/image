@@ -107,6 +107,7 @@ Small codebase:
 | `app.py` | Contains the full application source. |
 | `requirements.txt` | Lists installable dependencies. |
 | `.gitignore` | Excludes virtual environments, local secrets, and model/output caches. |
+| `test_pipeline.py` | Self-check: real tiny-pipeline generation + real CLIP scoring + regression tests. |
 
 ---
 
@@ -123,6 +124,16 @@ Small codebase:
    scored results, and offer PNG downloads.
 8. If a generation or evaluation step fails, show a clear error or mark the score unavailable. Do not
    use a replacement image or value.
+
+> **Note on concurrency and shape validation.** The Diffusers pipeline is cached once per server
+> process (`@st.cache_resource`) and shared by every Streamlit session, and its scheduler is
+> stateful (`timesteps`, `sigmas`, `step_index`). Generation is therefore serialised with a
+> `threading.Lock`, and the scheduler is put into a verified state before each run
+> (`len(timesteps) == steps`, `len(sigmas) == steps + 1`) and repaired afterwards. Generator output
+> is coerced through `to_rgb_pil()`, which accepts PIL images or arrays in CHW/HWC layout, with or
+> without a batch dimension, and 1/3/4 channels (RGBA is converted, not indexed at channel 3).
+> CLIP scoring validates that `pixel_values` is `(batch, 3, H, W)`, that the two embeddings are
+> 2-D, same-dimension, non-degenerate and finite, and that the result lies in [-1, 1].
 
 > **Note on the CLIP call.** The app uses a single forward pass
 > (`outputs = model(**inputs)`, then `outputs.text_embeds` / `outputs.image_embeds`) rather than
@@ -222,6 +233,29 @@ needed. Review current usage prices/credits before making hosted calls.
    any generated image with its PNG button.
 7. To test hosted mode, select it in the sidebar, provide an HF token, and run the same flow. Check
    billing/credits before calling the provider.
+
+---
+
+## Self-check / tests
+
+```powershell
+python test_pipeline.py
+```
+
+This runs 12 checks with **real** model code - nothing is stubbed or faked:
+
+- **Real diffusion generation** through `app.generate_local()` using the tiny
+  `hf-internal-testing/tiny-sd-pipe` checkpoint (a few MB, CPU-friendly). Prompt encoding, latent
+  preparation, the scheduler loop, VAE decode and postprocessing all execute.
+- **Concurrency**: 2-step and 4-step generations run simultaneously on one shared pipeline - the
+  situation that produced the scheduler `IndexError` - and both must succeed.
+- **Lock regression**: two threads entering the pipeline must never overlap (max concurrent
+  entries = 1).
+- **Real CLIP scoring** of a real image; the score must be finite and within [-1, 1].
+- **Shape validation**: CHW, HWC, batched, RGBA, grayscale and malformed arrays, plus the scheduler
+  overrun reproduction and its repair.
+
+Expected output ends with `12/12 checks passed`.
 
 ---
 
@@ -339,6 +373,14 @@ billed; CLIP evaluation remains local in both modes.
   that you accepted any model terms. Never use a GitHub PAT in that field.
 - **Hosted billing/429/provider error:** review current credits, rate limits, provider availability, and
   account billing; try later or use local mode.
+- **`Generation failed (IndexError): index 3 is out of bounds for dimension 0 with size 3`:** the
+  diffusion scheduler was stepped more times than its schedule allows. A scheduler configured for
+  N steps holds N+1 sigma values, so the default 2 steps give 3 sigmas and one extra step asks for
+  `sigmas[3]`. This is scheduler *state corruption*, caused by two generations sharing the single
+  cached pipeline at the same time (two browser tabs, two students, or a rerun during generation).
+  The app now serialises every pipeline call with a lock, verifies the scheduler state before each
+  run and repairs it afterwards. If it still appears, restart the Streamlit server to discard the
+  cached pipeline.
 - **First run appears slow:** model downloads are large. Keep the terminal open and wait for the
   progress/error message. A failed request is surfaced, not replaced by a placeholder.
 
