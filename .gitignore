@@ -1,0 +1,35 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local secrets — never commit tokens
+.env
+.env.*
+secrets.toml
+.streamlit/secrets.toml
+hf_token.txt
+HF_TOKEN
+
+# Model / Hugging Face caches
+.cache/
+.cache/huggingface/
+huggingface/
+models/
+
+# Generated outputs
+outputs/
+generated_*.png
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

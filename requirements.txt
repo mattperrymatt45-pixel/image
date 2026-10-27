@@ -1,0 +1,18 @@
+# Text-to-Image Generation and Semantic Evaluation using Generative AI
+#
+# Install PyTorch FIRST, so the correct CPU or CUDA build is selected:
+#   python -m pip install torch
+# (NVIDIA users: pick the CUDA build from the official PyTorch install selector.)
+#
+# Then install the rest:
+#   python -m pip install -r requirements.txt
+#
+# Minimum supported Python: 3.10 (3.11 recommended).
+
+streamlit>=1.49
+diffusers>=0.31
+transformers>=4.44
+accelerate>=0.33
+safetensors>=0.4
+huggingface_hub>=0.25
+Pillow>=10.0
