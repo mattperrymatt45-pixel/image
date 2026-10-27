@@ -428,9 +428,12 @@ def sidebar() -> dict:
         key="seed_box",
         help="Same seed + same settings + same model reproduces the image.",
     )
-    if st.sidebar.button("Randomise seed"):
+    def _randomise_seed() -> None:
+        # Must run as an on_click callback: assigning to a widget's key after
+        # the widget is instantiated raises StreamlitWidgetAlreadyInstantiatedError.
         st.session_state["seed_box"] = random.randint(0, 2**31 - 1)
-        st.rerun()
+
+    st.sidebar.button("Randomise seed", on_click=_randomise_seed)
 
     token = ""
     if backend == BACKEND_HOSTED:
